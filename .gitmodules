@@ -1,0 +1,3 @@
+[submodule "lightds"]
+	path = lightds
+	url = git@bitbucket.org:sxty_zhangzk/lightds.git

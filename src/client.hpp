@@ -8,20 +8,26 @@ class Client
 {
 public:
 	uint64_t dataIDAlloc;
-	Client(LightDS::User &srv)
+	Client(LightDS::User &srv) : srv(srv)
 	{
-		this->srv = srv;
-		dataIDAlloc = 0;	
+		static uint64_t dataIDAlloc = 0;	
 	}
 	
 
 public:
+
+	void dataIDAllocPlusOne()
+	{
+		dataIDAlloc++;
+	}
+
 	// FINISHED
 	// Create creates a new file on the specific path on GFS.
 	GFSError 
 		Create(const std::string &path)
 		{
-			GFSError mid = srv.RPCCall(srv.ListService("master")[0], "RPCCreateFile", path);	
+			GFSError mid = srv.RPCCall(srv.ListService("master")[0], "RPCCreateFile", path).get().as<GFSError>();	
+			std::cerr << "OUT\n";
 			return mid;
 		}
 
@@ -30,7 +36,7 @@ public:
 	GFSError 
 		Mkdir(const std::string &path)
 		{
-			GFSError mid = srv.RPCCall(srv.ListService("master")[0], "RPCMkdir", path);
+			GFSError mid = srv.RPCCall(srv.ListService("master")[0], "RPCMkdir", path).get().as<GFSError>();
 			return mid;	
 		}
 
@@ -39,7 +45,7 @@ public:
 	std::tuple<GFSError, std::vector<std::string> /*filenames*/>
 		List(const std::string &path)
 		{
-			return srv.RPCCall(srv.ListService("master")[0], "RPCListFile", path);	
+			return srv.RPCCall(srv.ListService("master")[0], "RPCListFile", path).get().as<std::tuple<GFSError, std::vector<std::string>>>();	
 		}
 	
 	// FINISHED
@@ -54,29 +60,29 @@ public:
 			uint64_t off = offset;
 			while(true)
 			{
-				std::tuple<GFSError, ChunkHandle> mid = srv.RPCCaller(srv.ListService("master")[0], "RPCGetChunkHandle", path, off / Chunk::chunkLength);	
-				if(mid.errCode != GFSErrorCode::OK)
+				std::tuple<GFSError, ChunkHandle> mid = srv.RPCCall(srv.ListService("master")[0], "RPCGetChunkHandle", path, off / Chunk::chunkLength).get().as<std::tuple<GFSError, ChunkHandle>>();	
+				if(std::get<0>(mid).errCode != GFSErrorCode::OK)
 					return mid;
 				if(off % Chunk::chunkLength + readSize <= Chunk::chunkLength)
 				{
-					readList.push_back(make_tuple(mid.get<1>, off % Chunk::chunkLength, readSize));
+					readList.push_back(std::make_tuple(std::get<1>(mid), off % Chunk::chunkLength, readSize));
 					break;
 				}
-				readList.push_back(make_tuple(mid.get<1>, off % Chunk::chunkLength, Chunk::chunkLength - off % Chunk::chunklength);
+				readList.push_back(std::make_tuple(std::get<1>(mid), off % Chunk::chunkLength, Chunk::chunkLength - off % Chunk::chunkLength));
 				readSize -= (Chunk::chunkLength - off % Chunk::chunkLength);
 				off = 0;
 			}
 			std::string ans = "";
 			for(int i = 0; i < readList.size(); i++)
 			{
-				std::tuple<GFSError, std::string, std::vector<std::string>, std::uint64_t> mid = srv.RPCCall(srv.ListService("master")[0], "RPCGetPrimaryAndSecondaries", readList[i].get<0>);
-				std::tuple<GFSError, std::string> ansTuple = srv.RPCCall(mid.get<1>, "RPCReadChunk", readList[i].get<0>, readList[i].get<1>, readList[i].get<2>);
-				ans += ansTuple.get<1>;
+				std::tuple<GFSError, std::string, std::vector<std::string>, std::uint64_t> mid = srv.RPCCall(srv.ListService("master")[0], "RPCGetPrimaryAndSecondaries", std::get<0>(readList[i])).get().as<std::tuple<GFSError, std::string, std::vector<std::string>, std::uint64_t>>();
+				std::tuple<GFSError, std::string> ansTuple = srv.RPCCall(LightDS::User::RPCAddress::from_string(std::get<1>(mid)), "RPCReadChunk", std::get<0>(readList[i]), std::get<1>(readList[i]), std::get<2>(readList[i])).get().as<std::tuple<GFSError, std::string>>();
+				ans += std::get<1>(ansTuple);
 			}
 			int len = ans.length();
 			for(int i = 0; i < len; i++)
 				data[i] = ans[i];
-			return make_tuple(GFSError(GFSErrorCode::OK), len);
+			return std::make_tuple(GFSError(GFSErrorCode::OK), len);
 		}
 
 	// FINISHED
@@ -90,9 +96,9 @@ public:
 			uint64_t off = offset;
 			while(true)
 			{
-				std::tuple<GFSError, ChunkHandle> mid = srv.RPCCaller(srv.ListService("master")[0], "RPCGetChunkHandle", path, off / Chunk::chunkLength);	
-				if(mid.errCode != GFSErrorCode::OK)
-					return mid;
+				std::tuple<GFSError, ChunkHandle> mid = srv.RPCCall(srv.ListService("master")[0], "RPCGetChunkHandle", path, off / Chunk::chunkLength).get().as<std::tuple<GFSError, ChunkHandle>>();	
+				if(std::get<0>(mid).errCode != GFSErrorCode::OK)
+					return std::get<0>(mid);
 				if(off % Chunk::chunkLength + writeSize <= Chunk::chunkLength)
 				{
 					std::string chuanru;
@@ -100,28 +106,29 @@ public:
 					for(int j = vctNow; j < vctNow + writeSize; j++)
 						chuanru += data[j];
 					vctNow += writeSize;
-					writeList.push_back(make_tuple(mid.get<1>, off % Chunk::chunkLength, chuanru));
+					writeList.push_back(std::make_tuple(std::get<1>(mid), off % Chunk::chunkLength, chuanru));
 					break;
 				}
 				std::string chuanru;
 				chuanru.clear();
-				for(int j = vctNow; j < vctNow + Chunk::chunkLength - off % Chunk::chunklength; j++)
+				for(int j = vctNow; j < vctNow + Chunk::chunkLength - off % Chunk::chunkLength; j++)
 					chuanru += data[j];
-				vctNow += Chunk::chunkLength - off % Chunk::chunklength;
-				writeList.push_back(make_tuple(mid.get<1>, off % Chunk::chunkLength(), chuanru);
+				vctNow += Chunk::chunkLength - off % Chunk::chunkLength;
+				writeList.push_back(std::make_tuple(std::get<1>(mid), off % Chunk::chunkLength, chuanru));
 				writeSize -= (Chunk::chunkLength - off % Chunk::chunkLength);
 				off = 0;
 			}
 			for(int i = 0; i < writeList.size(); i++)
 			{
-				std::tuple<GFSError, std::string, std::vector<std::string>, std::uint64_t> mid = srv.RPCCall(srv.ListService("master")[0], "RPCGetPrimaryAndSecondaries", readList[i].get<0>);
-				uint64_t curID = dataIDAlloc++;
-				GFSError mid_pri = srv.RPCCall(mid.get<1>, "RPCPushData", curID, writeList.get<2>);
-				for(int j = 0; j < secondaries.size(); j++)
+				std::tuple<GFSError, std::string, std::vector<std::string>, std::uint64_t> mid = srv.RPCCall(srv.ListService("master")[0], "RPCGetPrimaryAndSecondaries", std::get<0>(writeList[i])).get().as<std::tuple<GFSError, std::string, std::vector<std::string>, std::uint64_t>>();
+				uint64_t curID = dataIDAlloc;
+				dataIDAllocPlusOne();
+				GFSError mid_pri = srv.RPCCall(LightDS::User::RPCAddress::from_string(std::get<1>(mid)), "RPCPushData", curID, std::get<2>(writeList[i])).get().as<GFSError>();
+				for(int j = 0; j < std::get<2>(mid).size(); j++)
 				{
-					GFSError mid_sec = srv.RPCCall(mid.get<2>[j], "RPCPushData", curID, writeList.get<2>);	
+					GFSError mid_sec = srv.RPCCall(LightDS::User::RPCAddress::from_string(std::get<2>(mid)[j]), "RPCPushData", curID, std::get<2>(writeList[i])).get().as<GFSError>();	
 				}
-				std::tuple<GFSError, std::string> ansTuple = srv.RPCCall(mid.get<1>, "RPCWriteChunk", writeList[i].get<0>, curID, writeList[i].get<1>, readList[i].get<2>);
+				std::tuple<GFSError, std::string> ansTuple = srv.RPCCall(LightDS::User::RPCAddress::from_string(std::get<1>(mid)), "RPCWriteChunk", std::get<0>(writeList[i]), curID, std::get<1>(writeList[i]), std::get<2>(writeList[i])).get().as<std::tuple<GFSError, std::string>>();
 			}
 			return GFSError(GFSErrorCode::OK);
 		}
@@ -132,26 +139,27 @@ public:
 		Append(const std::string &path, const std::vector<char> &data)
 		{
 			uint64_t appendSize = data.size();
-			int num = srv.RPCCall(srv.ListService("master")[0], "RPCGetChunkHandleForAppend", path);
-			std::tuple<GFSError, ChunkHandle> mid = srv.RPCCall(srv.ListService("master")[0], "RPCGetChunkHandle", path, num);
+			int num = srv.RPCCall(srv.ListService("master")[0], "RPCGetChunkHandleForAppend", path).get().as<int>();
+			std::tuple<GFSError, ChunkHandle> mid = srv.RPCCall(srv.ListService("master")[0], "RPCGetChunkHandle", path, num).get().as<std::tuple<GFSError, ChunkHandle>>();
 			std::string dataString;
 			for(int i = 0; i < data.size(); i++)
 				dataString += data[i];
-			std::tuple<GFSError, std::string, std::vector<std::string>> pas = srv.RPCCall(srv.ListService("master")[0], "RPCGetPrimaryAndSecondaries", mid.get<1>);
-			uint64_t curID = dataIDAlloc++;
-			GFSError mid_pri = srv.RPCCall(pas.get<1>, "RPCPushData", curID, dataString);
-			uint64_t off = srv.RPCCall(pas.get<1>, "getFileSizeFromHandle", mid.get<1>);
-			for(int i = 0; i < secondaries.size(); i++)
-				GFSError mid_sec = srv.RPCCall(pas.get<2>[i], "RPCPushData", curID, dataString);
-			std::tuple<GFSError, std::uint64_t> ans = srv.RPCCall(pas.get<1>, "RPCAppendChunk", mid.get<1>, curID, pas.get<2>);
-			if(ans.get<0>.errCode == GFSErrorCode::retryAppend)
+			std::tuple<GFSError, std::string, std::vector<std::string>> pas = srv.RPCCall(srv.ListService("master")[0], "RPCGetPrimaryAndSecondaries", std::get<1>(mid)).get().as<std::tuple<GFSError, std::string, std::vector<std::string>>>();
+			uint64_t curID = dataIDAlloc;
+			dataIDAllocPlusOne();
+			GFSError mid_pri = srv.RPCCall(LightDS::User::RPCAddress::from_string(std::get<1>(pas)), "RPCPushData", curID, dataString).get().as<GFSError>();
+			uint64_t off = srv.RPCCall(LightDS::User::RPCAddress::from_string(std::get<1>(pas)), "getFileSizeFromHandle", std::get<1>(mid)).get().as<uint64_t>();
+			for(int i = 0; i < std::get<2>(pas).size(); i++)
+				GFSError mid_sec = srv.RPCCall(LightDS::User::RPCAddress::from_string(std::get<2>(pas)[i]), "RPCPushData", curID, dataString).get().as<GFSError>();
+			std::tuple<GFSError, std::uint64_t> ans = srv.RPCCall(LightDS::User::RPCAddress::from_string(std::get<1>(pas)), "RPCAppendChunk", std::get<1>(mid), curID, std::get<2>(pas)).get().as<std::tuple<GFSError, std::uint64_t>>();
+			if(std::get<0>(ans).errCode == GFSErrorCode::retryAppend)
 			{
-				mid = srv.RPCCall(srv.ListService("master")[0], "RPCGetChunkHandle", path, num + 1);
-				pas = srv.RPCCall(srv.ListService("master")[0], "RPCGetPrimaryAndSecondaries", mid.get<1>);
-				ans = srv.RPCCall(pas.get<1>, "RPCAppendChunk", mid.get<1>, curID, pas.get<2>);
+				mid = srv.RPCCall(srv.ListService("master")[0], "RPCGetChunkHandle", path, num + 1).get().as<std::tuple<GFSError, ChunkHandle>>();
+				pas = srv.RPCCall(srv.ListService("master")[0], "RPCGetPrimaryAndSecondaries", std::get<1>(mid)).get().as<std::tuple<GFSError, std::string, std::vector<std::string>>>();
+				ans = srv.RPCCall(LightDS::User::RPCAddress::from_string(std::get<1>(pas)), "RPCAppendChunk", std::get<1>(mid), curID, std::get<2>(pas)).get().as<std::tuple<GFSError, std::uint64_t>>();
 				off = 0;
 			}
-			return make_tuple(GFSError(GFSError::OK), off);	
+			return std::make_tuple(GFSError(GFSErrorCode::OK), off);	
 			
 		}
 
@@ -162,7 +170,7 @@ public:
 	std::tuple<GFSError, ChunkHandle>
 		GetChunkHandle(const std::string &path, std::uint64_t index)
 		{
-			return srv.RPCCall(srv.ListService("master")[0], "RPCGetChunkHandle", path, index);
+			return srv.RPCCall(srv.ListService("master")[0], "RPCGetChunkHandle", path, index).get().as<std::tuple<GFSError, ChunkHandle>>();
 		}
 
 	// FINISHED
@@ -172,11 +180,11 @@ public:
 		ReadChunk(ChunkHandle handle, std::uint64_t offset, std::vector<char> &data)
 		{
 			uint64_t len = data.size();
-			std::tuple<GFSError, std::string, std::vector<std::string>, uint64_t> pas = srv.RPCCall(srv.ListService("master")[0], "GetPrimaryAndSecondaries", handle);
-			std::tuple<GFSError, std::string>mid = srv.RPCCall(pas.get<1>, "RPCReadChunk", handle, offset, len);
-			for(int i = 0; i < mid.get<1>.size(); i++)
-				data[i] = mid.get<1>[i];
-			return make_tuple(GFSError(GFSErrorCode::OK), mid.get<1>.size());
+			std::tuple<GFSError, std::string, std::vector<std::string>, uint64_t> pas = srv.RPCCall(srv.ListService("master")[0], "GetPrimaryAndSecondaries", handle).get().as<std::tuple<GFSError, std::string, std::vector<std::string>, uint64_t>>();
+			std::tuple<GFSError, std::string> mid = srv.RPCCall(LightDS::User::RPCAddress::from_string(std::get<1>(pas)), "RPCReadChunk", handle, offset, len).get().as<std::tuple<GFSError, std::string>>();
+			for(int i = 0; i < std::get<1>(mid).size(); i++)
+				data[i] = std::get<1>(mid)[i];
+			return std::make_tuple(GFSError(GFSErrorCode::OK), std::get<1>(mid).size());
 		}
 	
 	// FINISHED
@@ -188,14 +196,15 @@ public:
 			std::string dataString;
 			for(int i = 0; i < data.size(); i++)
 				dataString += data[i];
-			std::tuple<GFSError, std::string, std::vector<std::string>, uint64_t> pas = srv.RPCCall(srv.ListService("master")[0], "GetPrimaryAndSecondaries", handle);
-			uint64_t curID = dataIDAlloc++;
-			GFSError mid_pri = srv.RPCCall(pas.get<1>, "RPCPushData", curID, dataString);
-			for(int i = 0; i < pas.get<2>.size(); i++)
+			std::tuple<GFSError, std::string, std::vector<std::string>, uint64_t> pas = srv.RPCCall(srv.ListService("master")[0], "GetPrimaryAndSecondaries", handle).get().as<std::tuple<GFSError, std::string, std::vector<std::string>, uint64_t>>();
+			uint64_t curID = dataIDAlloc;
+			dataIDAllocPlusOne();
+			GFSError mid_pri = srv.RPCCall(LightDS::User::RPCAddress::from_string(std::get<1>(pas)), "RPCPushData", curID, dataString).get().as<GFSError>();
+			for(int i = 0; i < std::get<2>(pas).size(); i++)
 			{
-				GFSError mid_sec = srv.RPCCall(pas.get<2>[i], "RPCPushData", curID, dataString);	
+				GFSError mid_sec = srv.RPCCall(LightDS::User::RPCAddress::from_string(std::get<2>(pas)[i]), "RPCPushData", curID, dataString).get().as<GFSError>();	
 			}
-			GFSError ans = srv.RPCCall(pas.get<1>, "RPCWriteChunk", handle, curID, offset, pas.get<2>);
+			GFSError ans = srv.RPCCall(LightDS::User::RPCAddress::from_string(std::get<1>(pas)), "RPCWriteChunk", handle, curID, offset, std::get<2>(pas)).get().as<GFSError>();
 			return ans;
 		}
 	
@@ -209,15 +218,16 @@ public:
 			std::string dataString;
 			for(int i = 0; i < data.size(); i++)
 				dataString += data[i];
-			std::tuple<GFSError, std::string, std::vector<std::string>, uint64_t> pas = srv.RPCCall(srv.ListService("master")[0], "GetPrimaryAndSecondaries", handle);
-			uint64_t curID = dataIDAlloc++;
-			GFSError mid_pri = srv.RPCCall(pas.get<1>, "RPCPushData", curID, dataString);
-			for(int i = 0; i < pas.get<2>.size(); i++)
+			std::tuple<GFSError, std::string, std::vector<std::string>, uint64_t> pas = srv.RPCCall(srv.ListService("master")[0], "GetPrimaryAndSecondaries", handle).get().as<std::tuple<GFSError, std::string, std::vector<std::string>, uint64_t>>();
+			uint64_t curID = dataIDAlloc;
+			dataIDAllocPlusOne();
+			GFSError mid_pri = srv.RPCCall(LightDS::User::RPCAddress::from_string(std::get<1>(pas)), "RPCPushData", curID, dataString).get().as<GFSError>();
+			for(int i = 0; i < std::get<2>(pas).size(); i++)
 			{
-				GFSError mid_sec = srv.RPCCall(pas.get<2>[i], "RPCPushData", curID, dataString);	
+				GFSError mid_sec = srv.RPCCall(LightDS::User::RPCAddress::from_string(std::get<2>(pas)[i]), "RPCPushData", curID, dataString).get().as<GFSError>();	
 			}
-			uint64_t off = srv.RPCCall(pas.get<1>, "getFileSizeFromHandle", handle);
-			std::tuple<GFSError, std::uint64_t> ans = srv.RPCCall(pas.get<1>, "RPCAppendChunk", mid.get<1>, curID, pas.get<2>);
+			uint64_t off = srv.RPCCall(LightDS::User::RPCAddress::from_string(std::get<1>(pas)), "getFileSizeFromHandle", handle).get().as<uint64_t>();
+			std::tuple<GFSError, std::uint64_t> ans = srv.RPCCall(LightDS::User::RPCAddress::from_string(std::get<1>(pas)), "RPCAppendChunk", handle, curID, std::get<2>(pas)).get().as<std::tuple<GFSError, std::uint64_t>>();
 			return ans;
 		}
 

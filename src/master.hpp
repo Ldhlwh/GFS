@@ -7,6 +7,7 @@
 #include <vector>
 #include <mutex>
 #include <deque>
+#include <tuple>
 #include <algorithm>
 #include <fstream>
 #include "metadata.hpp"
@@ -28,41 +29,45 @@ public:
 	const uint64_t replicaNum = 3;
 	const time_t checkTime = 180;
 	const time_t serverDeadTime = 60;
+	uint64_t treeCnt;
 	
-	void bind(std::string rpcName, Ret(*func)(Args...))
+	Master(LightDS::Service &srv, const std::string &root) : srv(srv), rootDir(root)
 	{
-		srv.RPCBind(rpcName, std::function<Ret(Args...)>([this, func](Args ...args) -> Ret 
-		{
-			return (this->*func)(std::forward<Args>(args)...);
-		}));
-	}
-	
-	Master(LightDS::Service &srv, const std::string &rootDir)
-	{
-		this->rootDir = rootDir;	
-		this->srv = srv;
 		chunkHandleAlloc = 1;
 		chunkCnt = 0;
+		treeCnt = 0;
+		dirTree.root->dirName = "/";
 		
-		bind("RPCCreateFile", &RPCCreateFile);
-		bind("RPCDeleteFile", &RPCDeleteFile);
-		bind("RPCGetChunkHandle", &RPCGetChunkHandle);
-		bind("RPCGetFileInfo", &RPCGetFileInfo);
-		bind("RPCGetPrimaryAndSecondaries", &RPCGetPrimaryAndSecondaries);
-		bind("RPCGetReplicas", &RPCGetReplicas);
-		bind("RPCHeartbeat", &RPCHeartbeat);
-		bind("RPCListFile", &RPCListFile);
-		bind("RPCMkdir", &RPCMkdir);
-		bind("RPCGetChunkHandleForAppend", &RPCGetChunkHandleForAppend);
+		srv.RPCBind<std::tuple<GFSError, std::vector<ChunkHandle>>(std::vector<ChunkHandle>, std::vector<std::tuple<ChunkHandle, ChunkVersion>>, std::vector<ChunkHandle>)>("RPCHeartbeat", std::bind(&Master::RPCHeartbeat, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+		srv.RPCBind<std::tuple<GFSError, std::string, std::vector<std::string>, std::uint64_t>(ChunkHandle)>("RPCGetPrimaryAndSecondaries", std::bind(&Master::RPCGetPrimaryAndSecondaries, this, std::placeholders::_1));
+		srv.RPCBind<std::tuple<GFSError, std::vector<std::string>>(ChunkHandle)>("RPCGetReplicas", std::bind(&Master::RPCGetReplicas, this, std::placeholders::_1));
+		srv.RPCBind<std::tuple<GFSError, bool, std::uint64_t, std::uint64_t>(std::string)>("RPCGetFileInfo", std::bind(&Master::RPCGetFileInfo, this, std::placeholders::_1));
+		srv.RPCBind<GFSError(std::string)>("RPCCreateFile", std::bind(&Master::RPCCreateFile, this, std::placeholders::_1));
+		srv.RPCBind<GFSError(std::string)>("RPCDeleteFile", std::bind(&Master::RPCDeleteFile, this, std::placeholders::_1));
+		srv.RPCBind<GFSError(std::string)>("RPCMkdir", std::bind(&Master::RPCMkdir, this, std::placeholders::_1));
+		srv.RPCBind<std::tuple<GFSError, std::vector<std::string>>(std::string)>("RPCListFile", std::bind(&Master::RPCListFile, this, std::placeholders::_1));
+		srv.RPCBind<int(std::string)>("RPCGetChunkHandleForAppend", std::bind(&Master::RPCGetChunkHandleForAppend, this, std::placeholders::_1));
+		srv.RPCBind<std::tuple<GFSError, ChunkHandle>(std::string, std::uint64_t)>("RPCGetChunkHandle", std::bind(&Master::RPCGetChunkHandle, this, std::placeholders::_1, std::placeholders::_2));
+		
+		/*for(int i = 0; i < srv.ListService("chunkserver").size(); i++)
+		{
+			std::cerr << "hey\n";
+			ServerMeta* curSM = new ServerMeta;
+			pathToServerMeta[srv.ListService("chunkserver")[i].to_string()] = curSM;
+		}*/
+	
 	}
+	std::thread threadBG;
 	void Start()
 	{
+		std::cerr << "Master start\n";
 		running = 1;
 		pathToFileMeta.clear();
 		pathToServerMeta.clear();
 		handleToChunkMeta.clear();
+		threadBG = std::thread(BackgroundActivity);
 		
-		ifstream flog("MasterCheckpoint.log");
+		std::ifstream flog("MasterCheckpoint.log");
 		if(flog)
 		{
 			flog >> chunkHandleAlloc >> chunkCnt;
@@ -93,12 +98,13 @@ public:
 			}
 			
 			flog >> ss;
-			std::string hd;
+			ChunkHandle hd;
 			for(int i = 0; i < ss; i++)
 			{
 				flog >> hd;
 				ChunkMeta* curCM = new ChunkMeta;
 				flog >> curCM->handle >> curCM->preHandle >> curCM->nexHandle;
+				int sss;
 				flog >> sss;
 				for(int j = 0; j < sss; j++)
 				{
@@ -136,66 +142,75 @@ public:
 	}
 	void Shutdown()
 	{
+		{
+			std::lock_guard<std::mutex> lock(mtxStop);
+			stop = true;
+			cvStop.notify_all();
+		}
+		
+		threadBG.join();
+		
 		running = 0;
-		ofstream flog;
-		flog.open("MasterCheckpoint.log", ofstream::trunc);
-		flog << chunkHandleAlloc << endl << chunkCnt << endl << endl;
+		std::ofstream flog;
+		flog.open("MasterCheckpoint.log", std::ofstream::trunc);
+		flog << chunkHandleAlloc << std::endl << chunkCnt << std::endl << std::endl;
 		//DirTree
-		flog << treeCnt << endl;
+		flog << treeCnt << std::endl;
 		std::deque<DirectoryTree::Node*> array;
 		array.push_back(dirTree.root);
 		while(array.size())
 		{
-			DirectoryTree::Node* now = array.pop_front();	
-			std::deque<std::string> output = DirectoryTree::getPath(now);
+			DirectoryTree::Node* now = array[0];
+			array.pop_front();	
+			std::deque<std::string> output = dirTree.getPath(now);
 			for(int j = 0; j < output.size(); j++)
 				flog << output[j];
 			for(int j = 0; j < now->inferior.size(); j++)
 			{
 				array.push_back(now->inferior[j]);	
 			}
-			flog << endl;
+			flog << std::endl;
 		}
-		flog << endl;
+		flog << std::endl;
 		
 		//FileMeta
-		flog << pathToFileMeta.size() << endl;
+		flog << pathToFileMeta.size() << std::endl;
 		std::map<std::deque<std::string>, FileMeta*>::iterator it;
 		for(it = pathToFileMeta.begin(); it != pathToFileMeta.end(); it++)
 		{
 			flog << it->first.size() << " ";
 			for(int j = 0; j < it->first.size(); j++)
 				flog << it->first[j];
-			flog << " " << it->second->handle << " " << (int)it->second->deleted << " " << it->second->delTimeStamp << endl;	
+			flog << " " << it->second->handle << " " << (int)it->second->deleted << " " << it->second->delTimeStamp << std::endl;	
 		}
 		
 		//ChunkMeta
-		flog << handleToChunkMeta.size() << endl;
-		std::map<ChunkHandle, ChunkMeta*>::iterator it;
-		for(it = handleToChunkMeta.begin(); it != handleToChunkMeta.end(); it++)
+		flog << handleToChunkMeta.size() << std::endl;
+		std::map<ChunkHandle, ChunkMeta*>::iterator it1;
+		for(it1 = handleToChunkMeta.begin(); it1 != handleToChunkMeta.end(); it1++)
 		{
-			flog << it->first << " ";
-			flog << it->second->handle << " " << it->second->preHandle << " " << it->second->nexHandle << " ";
-			flog << it->second->atServer.size() << " ";
-			for(int j = 0; j < it->second->atServer.size(); j++)
-				flog << it->second->atServer[j] << " ";
-			if(it->second->mainChunk != "")
-				flog << it->second->mainChunk;
+			flog << it1->first << " ";
+			flog << it1->second->handle << " " << it1->second->preHandle << " " << it1->second->nexHandle << " ";
+			flog << it1->second->atServer.size() << " ";
+			for(int j = 0; j < it1->second->atServer.size(); j++)
+				flog << it1->second->atServer[j] << " ";
+			if(it1->second->mainChunk != "")
+				flog << it1->second->mainChunk;
 			else
 				flog << "NAN"; 
-			flog << " " << it->second->expireTimeStamp << " " << it->second->version << endl;
+			flog << " " << it1->second->expireTimeStamp << " " << it1->second->version << std::endl;
 		}
 		
 		//ServerMeta
-		flog << pathToServerMeta.size() << endl;
-		std::map<std::string, ServerMeta*>::iterator it;
-		for(it = pathToServerMeta.begin(); it != pathToServerMeta.end(); it++)
+		flog << pathToServerMeta.size() << std::endl;
+		std::map<std::string, ServerMeta*>::iterator it2;
+		for(it2 = pathToServerMeta.begin(); it2 != pathToServerMeta.end(); it2++)
 		{
-			flog << it->first << " ";	
-			flog << it->second->handleList.size() << " ";
-			for(int j = 0; j < it->second->handleList.size(); j++)
-				flog << it->second->handleList[j] << " ";
-			flog << it->second->lastHeartBeat << endl;
+			flog << it2->first << " ";	
+			flog << it2->second->handleList.size() << " ";
+			for(int j = 0; j < it2->second->handleList.size(); j++)
+				flog << it2->second->handleList[j] << " ";
+			flog << it2->second->lastHeartBeat << std::endl;
 		}
 		
 		flog.close();
@@ -221,7 +236,6 @@ public:
 		DirectoryTree()	
 		{
 			root = new Node();
-			root->dirName = rootDir;
 		}
 		std::deque<std::string> getPath(Node* nd)
 		{
@@ -267,7 +281,7 @@ public:
 	std::deque<std::string> turnPathIntoDeque(const std::string & str)
 	{
 		std::deque<std::string> path;
-		int last = 0, now = 1;
+		int last = 1, now = 1;
 		int len = str.length();
 		while(true)
 		{
@@ -279,16 +293,15 @@ public:
 			if(str[now] == '/')
 			{
 				path.push_back(str.substr(last, now - last));
-				last = now;
+				last = now + 1;
 			}
 			now++;
 		}
 		return path;
 	}
 	
-	DirectoryTree::Node* findNode(std::string path)
-	{
-		std::deque<std::string> pathDeque = turnPathIntoDeque(path);	
+	DirectoryTree::Node* findNode(std::deque<std::string> pathDeque)
+	{	
 		DirectoryTree::Node* now = dirTree.root;
 		for(int i = 1; i < pathDeque.size(); i++)
 		{
@@ -308,32 +321,34 @@ public:
 	std::map<std::string, ServerMeta*> pathToServerMeta;
 	std::map<ChunkHandle, ChunkMeta*> handleToChunkMeta;
 	
-	
+	std::mutex mtxStop;
+	std::condition_variable cvStop;
+	bool stop;
 	// FINISHED
 	// BackgroundActivity does all the background activities:
 	// dead chunkserver handling, garbage collection, stale replica detection, etc
 	void BackgroundActivity()
 	{
-		while(true)
+		using namespace std::chrono_literals;
+		std::unique_lock<std::mutex> lock(mtxStop);
+		for(; !stop; cvStop.wait_for(lock, 1s))
 		{
 			if(running == 0)
 				break;
 			time_t tt = time(NULL);
-			if(time(NULL) % checkTime == 0)
-			{
 				for(int i = 0; i < srv.ListService("chunkserver").size(); i++)//dead server & garbage
 				{
-					std::string serverID = srv.ListService("chunkserver")[i];
-					if(tt - pathToServerMeta[serverID]->lastHeartBeat > serverDeathTime)
+					std::string serverID = srv.ListService("chunkserver")[i].to_string();
+					if(tt - pathToServerMeta[serverID]->lastHeartBeat > serverDeadTime)
 					{
 						for(int j = 0; j < pathToServerMeta[serverID]->handleList.size(); j++)
 						{
 							ChunkHandle hd = pathToServerMeta[serverID]->handleList[i];
 							ChunkMeta* curCM = handleToChunkMeta[hd];
-							if(mainChunk == serverID)
+							if(curCM->mainChunk == serverID)
 							{
-								mainChunk == "";
-								expireTimeStamp = 0;	
+								curCM->mainChunk == "";
+								curCM->expireTimeStamp = 0;	
 							}
 							std::deque<std::string> updateAtServer;
 							for(int k = 0; k < curCM->atServer.size(); k++)
@@ -349,7 +364,7 @@ public:
 							int gs = srv.ListService("chunkserver").size();
 							for(int k = 0; k < gs; k++)
 							{
-								if(srv.ListService("chunkserver")[k] != serverID)
+								if(srv.ListService("chunkserver")[k].to_string() != serverID)
 								{
 									srv.RPCCall(srv.ListService("chunkserver")[k], "RPCDeleteChunk", serverID, hd);
 								}
@@ -358,10 +373,10 @@ public:
 					}
 				}
 			
-				std::map<ChunkHandle>::iterator it;
+				std::map<ChunkHandle, ChunkMeta*>::iterator it;
 				for(it = handleToChunkMeta.begin(); it != handleToChunkMeta.end(); it++)
 				{
-					ChunkMeta* curCM = *it;	
+					ChunkMeta* curCM = it->second;	
 					if(curCM->atServer.size() < replicaNum)
 					{
 						int fs = replicaNum - curCM->atServer.size();
@@ -369,7 +384,7 @@ public:
 						{
 							for(int j = 0; j < srv.ListService("chunkserver").size(); j++)
 							{
-								std::string thisID = srv.ListService("chunkserver")[j];
+								std::string thisID = srv.ListService("chunkserver")[j].to_string();
 								bool flag = 1;
 								for(int k = 0; k < curCM->atServer.size(); k++)
 								{
@@ -381,7 +396,7 @@ public:
 								}
 								if(flag)
 								{
-									GFSError mid = srv.RPCCall(curCM->atServer[0], "RPCSendCopy", curCM->handle, thisID);
+									GFSError mid = srv.RPCCall(LightDS::User::RPCAddress::from_string(curCM->atServer[0]), "RPCSendCopy", curCM->handle, thisID).get().as<GFSError>();
 									curCM->atServer.push_back(thisID);
 									pathToServerMeta[thisID]->handleList.push_back(curCM->handle);
 									if(mid.errCode != GFSErrorCode::OK)
@@ -392,16 +407,15 @@ public:
 						}
 					}
 				}
-			}
 		
-			std::map<std::deque<std::string>, FileMeta*>::iterator it;
-			for(it = pathToFileMeta.begin(); it != pathToFileMeta.end(); it++)
+			std::map<std::deque<std::string>, FileMeta*>::iterator it1;
+			for(it1 = pathToFileMeta.begin(); it1 != pathToFileMeta.end(); it1++)
 			{
-				FileMeta* curFM = (*it);
+				FileMeta* curFM = it1->second;
 				int subCnt = 0;
 				if(tt > curFM->delTimeStamp)
 				{
-					DirectoryTree::Node* delNode = findNode(it->first);
+					DirectoryTree::Node* delNode = findNode(it1->first);
 					DirectoryTree::Node* father = delNode->superior;
 					std::vector<DirectoryTree::Node*> updateInferior;
 					for(int i = 0; i < father->inferior.size(); i++)
@@ -432,7 +446,7 @@ public:
 							{
 								curSM->handleList.push_back(updateHandleList[j]);	
 							}
-							srv.RPCCall(serverID, "RPCDeleteChunk", serverID, curCM->handle);
+							srv.RPCCall(LightDS::User::RPCAddress::from_string(serverID), "RPCDeleteChunk", serverID, curCM->handle);
 						}
 						delete curCM;
 						treeCnt--;
@@ -452,6 +466,7 @@ public:
 	std::tuple<GFSError, std::vector<ChunkHandle> /*Garbage Chunks*/>
 		RPCHeartbeat(std::vector<ChunkHandle> leaseExtensions, std::vector<std::tuple<ChunkHandle, ChunkVersion>> chunks, std::vector<ChunkHandle> failedChunks)
 		{
+			std::cerr << "HB  "<<srv.getRPCCaller() << std::endl;
 			std::string serverID = srv.getRPCCaller();
 			time_t tt = time(NULL);
 			pathToServerMeta[serverID]->lastHeartBeat = tt;
@@ -461,26 +476,25 @@ public:
 			curSM->handleList.clear();
 			for(int i = 0; i < chunks.size(); i++)
 			{
-				ChunkMeta* curCM = handleToChunkMeta[chunks[i].get<0>];
-				if(curCM->version > chunks[i].get<1>)
+				ChunkMeta* curCM = handleToChunkMeta[std::get<0>(chunks[i])];
+				if(curCM->version > std::get<1>(chunks[i]))
 				{
-					garbageChunks.push_back(chunks[i].get<0>);
+					garbageChunks.push_back(std::get<0>(chunks[i]));
 				}
 				else
 				{
-					curCM->version = chunks[i].get<1>;
-					curSM->handleList.push_back(chunks[i].get<0>);	
+					curCM->version = std::get<1>(chunks[i]);
+					curSM->handleList.push_back(std::get<0>(chunks[i]));	
 				}
 			}
 			
-			time_t tt = time(NULL);
 			std::vector<std::tuple<ChunkHandle, ChunkVersion, std::uint64_t>> vct;
 			for(int i = 0; i < leaseExtensions.size(); i++)
 			{
 				ChunkMeta* curCM = handleToChunkMeta[leaseExtensions[i]];	
 				curCM->expireTimeStamp = tt + leaseTime;
 				curCM->version++;
-				vct.push_back(make_tuple(leaseExtensions[i], curCM->version, curCM->expireTimeStamp));
+				vct.push_back(std::make_tuple(leaseExtensions[i], curCM->version, curCM->expireTimeStamp));
 			}
 			
 			std::deque<std::string> updateAtServer;
@@ -498,7 +512,7 @@ public:
 					curCM->atServer.push_back(updateAtServer[j]);
 				garbageChunks.push_back(failedChunks[i]);
 			}
-			return make_tuple(GFSError(GFSErrorCode::OK), garbageChunks);
+			return std::make_tuple(GFSError(GFSErrorCode::OK), garbageChunks);
 		}
 
 	// FINISHED
@@ -511,7 +525,7 @@ public:
 			{
 				GFSError Csq(GFSErrorCode::invalidHandle);
 				std::vector<std::string> ans;
-				std::tuple<GFSError, std::string, std::vector<std::string>, std::uint64_t> Rtn = make_tuple(Csq, "", ans, 0);
+				std::tuple<GFSError, std::string, std::vector<std::string>, std::uint64_t> Rtn = std::make_tuple(Csq, "", ans, 0);
 				return Rtn;
 			}
 			ChunkMeta* curCM = handleToChunkMeta[handle];
@@ -527,7 +541,7 @@ public:
 					}
 				}
 				GFSError Csq(GFSErrorCode::OK);
-				std::tuple<GFSError, std::string, std::vector<std::string>, std::uint64_t> Rtn = make_tuple(Csq, primary, secondaries, curCM->expireTimeStamp);
+				std::tuple<GFSError, std::string, std::vector<std::string>, std::uint64_t> Rtn = std::make_tuple(Csq, primary, secondaries, curCM->expireTimeStamp);
 				return Rtn;
 			}
 			else
@@ -536,33 +550,33 @@ public:
 				curCM->expireTimeStamp = time(NULL) + leaseTime;
 				curCM->version++;
 				std::vector<std::tuple<ChunkHandle, ChunkVersion, std::uint64_t>> vct;
-				std::tuple<ChunkHandle, ChunkVersion, std::uint64_t> tmp = make_tuple(handle, curCM->version, curCM->expireTimeStamp);
+				std::tuple<ChunkHandle, ChunkVersion, std::uint64_t> tmp = std::make_tuple(handle, curCM->version, curCM->expireTimeStamp);
 				vct.push_back(tmp);
-				GFSError mid = srv.RPCCall(primary, "RPCGrantLease", vct);
+				GFSError mid = srv.RPCCall(LightDS::User::RPCAddress::from_string(primary), "RPCGrantLease", vct).get().as<GFSError>();
 				if(mid.errCode != GFSErrorCode::OK)
 				{
-					std::tuple<GFSError, std::string, std::vector<std::string>, std::uint64_t> Rtn = make_tuple(mid, "", std::vector<std::string>(), 0);
+					std::tuple<GFSError, std::string, std::vector<std::string>, std::uint64_t> Rtn = std::make_tuple(mid, "", std::vector<std::string>(), 0);
 					return Rtn;	
 				}
-				GFSError mid = srv.RPCCall(primary, "RPCUpdateVersion", handle, curCM->version);
+				mid = srv.RPCCall(LightDS::User::RPCAddress::from_string(primary), "RPCUpdateVersion", handle, curCM->version).get().as<GFSError>();
 				if(mid.errCode != GFSErrorCode::OK)
 				{
-					std::tuple<GFSError, std::string, std::vector<std::string>, std::uint64_t> Rtn = make_tuple(mid, "", std::vector<std::string>(), 0);
+					std::tuple<GFSError, std::string, std::vector<std::string>, std::uint64_t> Rtn = std::make_tuple(mid, "", std::vector<std::string>(), 0);
 					return Rtn;	
 				}
 				std::vector<std::string> secondaries;
 				for(int i = 1; i < curCM->atServer.size(); i++)
 				{
 					secondaries.push_back(curCM->atServer[i]);
-					GFSError mid = srv.RPCCall(curCM->atServer[i], "RPCUpdateVersion", curCM->version);
+					GFSError mid = srv.RPCCall(LightDS::User::RPCAddress::from_string(curCM->atServer[i]), "RPCUpdateVersion", curCM->version).get().as<GFSError>();
 					if(mid.errCode != GFSErrorCode::OK)
 					{
-						std::tuple<GFSError, std::string, std::vector<std::string>, std::uint64_t> Rtn = make_tuple(mid, "", std::vector<std::string>(), 0);
+						std::tuple<GFSError, std::string, std::vector<std::string>, std::uint64_t> Rtn = std::make_tuple(mid, "", std::vector<std::string>(), 0);
 						return Rtn;	
 					}
 				}
 				GFSError Csq(GFSErrorCode::OK);
-				std::tuple<GFSError, std::string, std::vector<std::string>, std::uint64_t> Rtn = make_tuple(Csq, primary, secondaries, curCM->expireTimeStamp);
+				std::tuple<GFSError, std::string, std::vector<std::string>, std::uint64_t> Rtn = std::make_tuple(Csq, primary, secondaries, curCM->expireTimeStamp);
 				return Rtn;
 			}
 		}
@@ -576,7 +590,7 @@ public:
 			{
 				GFSError Csq(GFSErrorCode::invalidHandle);
 				std::vector<std::string> ans;
-				std::tuple<GFSError, std::vector<std::string>> Rtn = make_tuple(Csq, ans);
+				std::tuple<GFSError, std::vector<std::string>> Rtn = std::make_tuple(Csq, ans);
 				return Rtn;
 			}
 			std::vector<std::string> ans;
@@ -585,7 +599,7 @@ public:
 				ans.push_back(handleToChunkMeta[handle]->atServer[i]);	
 			}
 			GFSError Csq(GFSErrorCode::OK);
-			std::tuple<GFSError, std::vector<std::string>> Rtn = make_tuple(Csq, ans);
+			std::tuple<GFSError, std::vector<std::string>> Rtn = std::make_tuple(Csq, ans);
 			return Rtn;
 		}
 	
@@ -600,14 +614,14 @@ public:
 				isDir = 0;
 			else
 				isDir = 1;
-			ChunkMeta* curCM = pathToFileMeta[pathDeque];
+			ChunkMeta* curCM = handleToChunkMeta[pathToFileMeta[pathDeque]->handle];
 			uint64_t cnt = 1;
-			while(curCM->nexChunk != NULL)
+			while(curCM->nexHandle != 0)
 			{
 				cnt++;	
 				curCM = handleToChunkMeta[curCM->nexHandle];
 			}
-			return make_tuple(GFSError(GFSErrorCode::OK), isDir, 0, cnt);
+			return std::make_tuple(GFSError(GFSErrorCode::OK), isDir, 0, cnt);
 		}
 
 	// FINISHED
@@ -618,7 +632,10 @@ public:
 			std::deque<std::string> pathDeque = turnPathIntoDeque(path);	
 			GFSError middle = RPCMkdir(path);
 			if(middle.errCode != GFSErrorCode::OK)
+			{
+				std::cerr << "error1\n";
 				return middle;	
+			}
 			treeCnt++;
 			FileMeta* curFM = new FileMeta;
 			ChunkHandle newHandle = chunkHandleAlloc++;
@@ -626,16 +643,20 @@ public:
 			pathToFileMeta[pathDeque] = curFM;
 			ChunkMeta* curCM = new ChunkMeta;
 			curCM->handle = newHandle;
-			for(int i = 0; i < serverList.size(); i++)
+			std::cerr << "this1\n";
+			std::map<std::string, ServerMeta*>::iterator it;
+			for(it = pathToServerMeta.begin(); it != pathToServerMeta.end(); it++)				
 			{
-				if(pathToServerMeta[serverList[i]]->handleList.size() <= chunkCnt / serverList.size())
+				std::cerr<< "this2\n";
+				if(it->second->handleList.size() <= chunkCnt / pathToServerMeta.size())
 				{
-					GFSError mid = srv.RPCCall(serverList[i], "RPCCreateChunk", newHandle);
+					std::cerr<< "this3\n";
+					GFSError mid = srv.RPCCall(LightDS::User::RPCAddress::from_string(it->first), "RPCCreateChunk", newHandle).get().as<GFSError>();
 					if(mid.errCode == GFSErrorCode::failedChunkCreation)
 						return mid;
 					handleToChunkMeta[newHandle] = curCM;
-					tmp->atServer.push_back(serverList[i]);
-					pathToServerMeta[serverList[i]]->handleList.push_back(newHandle);
+					curCM->atServer.push_back(it->first);
+					it->second->handleList.push_back(newHandle);
 					GFSError Csq(GFSErrorCode::OK);
 					return Csq;
 				}
@@ -656,7 +677,7 @@ public:
 			}
 			FileMeta* curFM = pathToFileMeta[pathDeque];
 			curFM->deleted = 1;
-			delTimeStamp = time(NULL) + delFileSaveTime;
+			curFM->delTimeStamp = time(NULL) + delFileSaveTime;
 			GFSError Csq;
 			Csq.errCode = GFSErrorCode::OK;
 			return Csq;
@@ -670,19 +691,11 @@ public:
 			GFSError Csq;
 			std::deque<std::string> pathDeque = turnPathIntoDeque(path);
 			DirectoryTree::Node* now = dirTree.root;
-			int curPath = 1;
-			if(pathDeque[0] != dirTree.root->dirName)
-			{
-				Csq.errCode = GFSErrorCode::invalidPath;
-				return Csq;
-			}
-			if(pathDeque.size() == 1)
-			{
-				Csq.errCode = GFSErrorCode::pathAlreadyExist;
-				return Csq;
-			}
+			int curPath = 0;
 			while(true)
 			{
+				bool jump = 0;
+				std::cerr << "HERE\n";
 				for(int i = 0; i < now->inferior.size(); i++)
 				{
 					if(now->inferior[i]->dirName == pathDeque[curPath])
@@ -694,21 +707,30 @@ public:
 						}
 						now = now->inferior[i];
 						curPath++;
-						continue;
+						jump = 1;
+						break;
 					}	
 				}
+				if(jump)
+					continue;
 				if(curPath == pathDeque.size() - 1)
 				{
+					std::cerr << "YEAH\n";
 					DirectoryTree::Node* newNode = new DirectoryTree::Node();
+					std::cerr << "YEAH1\n";
 					newNode->dirName = pathDeque[pathDeque.size() - 1];
+					std::cerr << "YEAH2\n";
 					newNode->superior = now;
+					std::cerr << "YEAH3\n";
 					now->inferior.push_back(newNode);
+					std::cerr << "YEAH4\n";
 					Csq.errCode = GFSErrorCode::OK;
-					
+					std::cerr << "YEAH5\n";
 					return Csq;
 				}	
 				else
 				{
+					std::cerr << "WATERLOO\n";
 					Csq.errCode = GFSErrorCode::invalidPath;
 					return Csq;
 				}
@@ -728,7 +750,7 @@ public:
 			{
 				Csq.errCode = GFSErrorCode::invalidPath;
 				std::vector<std::string> tmp;
-				std::tuple<GFSError, std::vector<std::string>> Rtn = make_tuple(Csq, tmp);
+				std::tuple<GFSError, std::vector<std::string>> Rtn = std::make_tuple(Csq, tmp);
 				return Rtn;
 			}
 			if(pathDeque.size() == 1)
@@ -738,7 +760,7 @@ public:
 					ans.push_back(now->inferior[i]->dirName);
 				std::sort(ans.begin(), ans.end());
 				Csq.errCode = GFSErrorCode::OK;
-				std::tuple<GFSError, std::vector<std::string>> Rtn = make_tuple(Csq, ans);
+				std::tuple<GFSError, std::vector<std::string>> Rtn = std::make_tuple(Csq, ans);
 				return Rtn;
 			}
 			while(true)
@@ -755,7 +777,7 @@ public:
 								ans.push_back(now->inferior[i]->dirName);
 							std::sort(ans.begin(), ans.end());
 							Csq.errCode = GFSErrorCode::OK;
-							std::tuple<GFSError, std::vector<std::string>> Rtn = make_tuple(Csq, ans);
+							std::tuple<GFSError, std::vector<std::string>> Rtn = std::make_tuple(Csq, ans);
 							return Rtn;
 						}
 						now = now->inferior[i];
@@ -764,19 +786,19 @@ public:
 					}	
 				}
 				std::vector<std::string> tmp;
-				Csq.errCode = invalidPath;
-				std::tuple<GFSError, std::vector<std::string>> Rtn = make_tuple(Csq, tmp);
+				Csq.errCode = GFSErrorCode::invalidPath;
+				std::tuple<GFSError, std::vector<std::string>> Rtn = std::make_tuple(Csq, tmp);
 				return Rtn;
 			}
 		};
 		
-	int	RPCGetChunkHandleForAppend(std::path)
+	int	RPCGetChunkHandleForAppend(std::string path)
 	{
 		int ans = 0;
 		std::deque<std::string> pathDeque = turnPathIntoDeque(path);
 		FileMeta* curFM = pathToFileMeta[pathDeque];
 		ChunkMeta* curCM = handleToChunkMeta[curFM->handle];
-		while(curCM->nexChunk != 0)
+		while(curCM->nexHandle != 0)
 		{
 			curCM = handleToChunkMeta[curCM->nexHandle];
 			ans++;
@@ -788,17 +810,17 @@ public:
 	// RPCGetChunkHandle returns the chunk handle of (path, index).
 	// If the requested index is larger than the number of chunks of this path by exactly one, create one.
 	std::tuple<GFSError, ChunkHandle>
-		RPCGetChunkHandle(std::string path, std::uint64_t chunkIndex);
+		RPCGetChunkHandle(std::string path, std::uint64_t chunkIndex)
 		{
 			std::deque<std::string> pathDeque = turnPathIntoDeque(path);
 			if(pathToFileMeta.count(pathDeque))
 			{
-				FileMeta* curFM = pathToFileMeta[path];
+				FileMeta* curFM = pathToFileMeta[pathDeque];
 				if(curFM->deleted)
 				{
 					GFSError Csq;
 					Csq.errCode = GFSErrorCode::fileDeleted;
-					std::tuple<GFSError, CHunkHandle> Rtn = make_tuple(Csq, 0);
+					std::tuple<GFSError, ChunkHandle> Rtn = std::make_tuple(Csq, (uint64_t)0);
 					return Rtn;	
 				}
 				ChunkMeta* curCM = handleToChunkMeta[curFM->handle];
@@ -809,7 +831,7 @@ public:
 					{
 						GFSError Csq;
 						Csq.errCode = GFSErrorCode::indexOutOfBound;
-						std::tuple<GFSError, ChunkHandle> Rtn = make_tuple(Csq, -1);	
+						std::tuple<GFSError, ChunkHandle> Rtn = std::make_tuple(Csq, -1);	
 						return Rtn;
 					}
 					curCM = handleToChunkMeta[tmp];
@@ -823,32 +845,33 @@ public:
 					tmp->preHandle = curCM->handle;
 					curCM->nexHandle = newHandle;
 					tmp->handle = newHandle;
-					for(int i = 0; i < serverList.size(); i++)
+					std::map<std::string, ServerMeta*>::iterator it;
+					for(it = pathToServerMeta.begin(); it != pathToServerMeta.end(); it++)
 					{
-						if(pathToServerMeta[serverList[i]]->handleList.size() <= chunkCnt / serverList.size())
+						if(it->second->handleList.size() <= chunkCnt / pathToServerMeta.size())
 						{
-							GFSError mid = srv.RPCCall(serverList[i], "RPCCreateChunk", newHandle);
+							GFSError mid = srv.RPCCall(LightDS::User::RPCAddress::from_string(it->first), "RPCCreateChunk", newHandle).get().as<GFSError>();
 							if(mid.errCode == GFSErrorCode::failedChunkCreation)
 							{
-								std::tuple<GFSError, ChunkHandle> Rtn = make_tuple(mid, 0);
+								std::tuple<GFSError, ChunkHandle> Rtn = std::make_tuple(mid, (uint64_t)0);
 								return Rtn;	
 							}
 							handleToChunkMeta[newHandle] = tmp;
-							tmp->atServer.push_back(serverList[i]);
-							pathToServerMeta[serverList[i]]->handleList.push_back(newHandle);
+							tmp->atServer.push_back(it->first);
+							it->second->handleList.push_back(newHandle);
 							break;
 						}
 					}
 					GFSError Csq;
 					Csq.errCode = GFSErrorCode::OK;
-					std::tuple<GFSError, ChunkHandle> Rtn = make_tuple(Csq, newHandle);
+					std::tuple<GFSError, ChunkHandle> Rtn = std::make_tuple(Csq, newHandle);
 					return Rtn;
 				}
 				else
 				{
 					GFSError Csq;
 					Csq.errCode = GFSErrorCode::OK;
-					std::tuple<GFSError, ChunkHandle> Rtn = make_tuple(Csq, tmp);
+					std::tuple<GFSError, ChunkHandle> Rtn = std::make_tuple(Csq, tmp);
 					return Rtn;	
 				}
 			}
@@ -856,7 +879,7 @@ public:
 			{
 				GFSError Csq;
 				Csq.errCode = GFSErrorCode::invalidPath;
-				std::tuple<GFSError, ChunkHandle> Rtn = make_tuple(Csq, 0);
+				std::tuple<GFSError, ChunkHandle> Rtn = std::make_tuple(Csq, 0);
 				return Rtn;
 			}
 		}

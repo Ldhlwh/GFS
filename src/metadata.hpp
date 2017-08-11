@@ -8,19 +8,19 @@
 
 class FileMeta
 {
-	friend class master;
+	friend class Master;
 private:
 	ChunkHandle handle;
 	bool deleted;
 	time_t delTimeStamp;
 	
 public:
-	Metadata()
+	FileMeta()
 	{
 		handle = delTimeStamp = 0;
 		deleted = 0;	
 	}
-	Metadata(ChunkHandle a)
+	FileMeta(ChunkHandle a)
 	{
 		handle = a;
 		delTimeStamp = 0;
@@ -30,7 +30,7 @@ public:
 
 class ChunkMeta
 {
-	friend class master;	
+	friend class Master;	
 private:
 	ChunkHandle handle, preHandle, nexHandle;
 	std::deque<std::string> atServer;
@@ -42,14 +42,14 @@ public:
 	ChunkMeta()
 	{
 		preHandle = nexHandle = 0;
-		mainChunk = NULL;
-		leaseTimeStamp = version = 0;
+		mainChunk = "";
+		expireTimeStamp = version = 0;
 	}
 };
 
 class ServerMeta
 {
-	friend class master;
+	friend class Master;
 private:
 	std::deque<ChunkHandle> handleList;
 	time_t lastHeartBeat;

@@ -11,19 +11,18 @@ class Chunk
 private:
 	ChunkHandle handle;
 	ChunkVersion version;
-	static uint64_t chunkLength = 67108864;	// = 64MB
 	uint64_t serialNo;
 	bool isPrimary;
 	time_t expireTimeStamp;
 	
 public:
+	static const uint64_t chunkLength = 67108864;	// = 64MB
 	std::mutex readLock; 
 	std::mutex writeLock;
 	
-	Chunk(ChunkHandle hd, ChunkVersion vs = 0)
+	Chunk()
 	{
-		handle = hd;
-		version = vs;
+		handle = version = 0;
 		isPrimary = 0;
 		expireTimeStamp = 0;
 		serialNo = 0;

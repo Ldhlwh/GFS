@@ -23,17 +23,27 @@ public:
 	
 	std::string chtos(ChunkHandle a)
 	{
-		ostringstream os;
+		std::ostringstream os;
 		os << a;	
 		std::string result;
-		istingstream is(os.str());
+		std::istringstream is(os.str());
 		is >> result;
-		reutrn result;
+		return result;
 	}
 	
-	uint64_t getFileSize(const char* strFileName)
+	std::string prtos(std::uint16_t a)
 	{
-	    FILE * fp = fopen(strFileName, "r");
+		std::ostringstream os;
+		os << a;
+		std::string result;
+		std::istringstream is;
+		is >> result;
+		return result;
+	}
+	
+	uint64_t getFileSize(std::string strFileName)
+	{
+	    FILE * fp = fopen(strFileName.c_str(), "r");
 	    fseek(fp, 0L, SEEK_END);
 	    uint64_t size = ftell(fp);
 	    fclose(fp);
@@ -42,60 +52,52 @@ public:
 	
 	uint64_t getFileSizeFromHandle(ChunkHandle handle)
 	{
-		return getFileSize((serverID + "_" + chtos(handle) + ".chunk").c_str());
+		return getFileSize((prtos(serverPort) + "_" + chtos(handle) + ".chunk"));
 	}
 	
-	void bind(std::string rpcName, Ret(*func)(Args...))
+	ChunkServer(LightDS::Service &srv, const std::string &rootDir) : srv(srv), rootDir(rootDir)
 	{
-		srv.RPCBind(rpcName, std::function<Ret(Args...)>([this, func](Args ...args) -> Ret 
-		{
-			return (this->*func)(std::forward<Args>(args)...);
-		}));
-	}
-
-	ChunkServer(LightDS::Service &srv, const std::string &rootDir)
-	{
-		this->srv = srv;
-		this->rootDir = rootDir;
 		running = 0;
-		serverID = srv.getLocalRPCPort();	
+		serverPort = srv.getLocalRPCPort();	
 		
-		bind("RPCAppendChunk", &RPCAppendChunk);
-		bind("RPCApplyCopy", &RPCApplyCopy);
-		bind("RPCApplyMutation", &RPCApplyMutation);
-		bind("RPCCreateChunk", &RPCCreateChunk);
-		bind("RPCGrantLease", &RPCGrantLease);
-		bind("RPCPushData", &RPCPushData);
-		bind("RPCReadChunk", &RPCReadChunk);
-		bind("RPCSendCopy", &RPCSendCopy);
-		bind("RPCUpdateVersion", &RPCUpdateVersion);
-		bind("RPCWriteChunk", &RPCWriteChunk);
-		bind("RPCDeleteChunk", &RPCDeleteChunk);
-		bind("getFileSizeFromHandle", &getFileSizeFromHandle);
+		srv.RPCBind<GFSError(std::uint16_t, ChunkHandle)>("RPCDeleteChunk", std::bind(&ChunkServer::RPCDeleteChunk, this, std::placeholders::_1, std::placeholders::_2));
+		srv.RPCBind<GFSError(ChunkHandle)>("RPCCreateChunk", std::bind(&ChunkServer::RPCCreateChunk, this, std::placeholders::_1));
+		srv.RPCBind<std::tuple<GFSError, std::string>(ChunkHandle, std::uint64_t, std::uint64_t)>("RPCReadChunk", std::bind(&ChunkServer::RPCReadChunk, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+		srv.RPCBind<GFSError(ChunkHandle, std::uint64_t, std::uint64_t, std::vector<std::string>)>("RPCWriteChunk", std::bind(&ChunkServer::RPCWriteChunk, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4));
+		srv.RPCBind<std::tuple<GFSError, std::uint64_t>(ChunkHandle, std::uint64_t, std::vector<std::string>)>("RPCAppendChunk", std::bind(&ChunkServer::RPCAppendChunk, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+		srv.RPCBind<GFSError(ChunkHandle, std::uint64_t, MutationType, std::uint64_t, std::uint64_t, std::uint64_t)>("RPCApplyMutation", std::bind(&ChunkServer::RPCApplyMutation, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5, std::placeholders::_6));
+		srv.RPCBind<GFSError(ChunkHandle, std::string)>("RPCSendCopy", std::bind(&ChunkServer::RPCSendCopy, this, std::placeholders::_1, std::placeholders::_2));
+		srv.RPCBind<GFSError(ChunkHandle, ChunkVersion, std::string, std::uint64_t)>("RPCApplyCopy", std::bind(&ChunkServer::RPCApplyCopy, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4));
+		srv.RPCBind<GFSError(std::vector<std::tuple<ChunkHandle, ChunkVersion, std::uint64_t>>)>("RPCGrantLease", std::bind(&ChunkServer::RPCGrantLease, this, std::placeholders::_1));
+		srv.RPCBind<GFSError(ChunkHandle, ChunkVersion)>("RPCUpdateVersion", std::bind(&ChunkServer::RPCUpdateVersion, this, std::placeholders::_1, std::placeholders::_2));
+		srv.RPCBind<GFSError(std::uint64_t, std::string)>("RPCPushData", std::bind(&ChunkServer::RPCPushData, this, std::placeholders::_1, std::placeholders::_2));
+		srv.RPCBind<uint64_t(std::string)>("getFileSize", std::bind(&ChunkServer::getFileSize, this, std::placeholders::_1));
+		srv.RPCBind<uint64_t(ChunkHandle)>("getFileSizeFromHandle", std::bind(&ChunkServer::getFileSizeFromHandle, this, std::placeholders::_1));
+	
 	}
 	void Start()
 	{
+		std::cerr << "ChunkServer : " << srv.getLocalRPCPort() << " start" << std::endl;
 		running = 1;
-		
-		chunkList.clear();
 		chunkMap.clear();
 		dataMap.clear();
+		BackgroundActivities();
 	}
 	void Shutdown()
 	{
 		running = 0;
 	}
-	std::string serverID;
+	std::uint16_t serverPort;
 
 protected:
 	LightDS::Service &srv;
 	std::string rootDir;
-	static time_t heartbeatTime = 30;
+	static const time_t heartbeatTime =  30;
 	bool running;
 
 public:
 	std::map<ChunkHandle, Chunk*> chunkMap;
-	std::map<std::u64int_t, std::string> dataMap;
+	std::map<std::uint64_t, std::string> dataMap;
 	
 	std::vector<ChunkHandle> leaseExtensions;
 	std::vector<ChunkHandle> failedChunks;
@@ -103,6 +105,7 @@ public:
 	//FINISHED
 	void BackgroundActivities()
 	{
+		Heartbeat();
 		while(true)
 		{
 			if(time(NULL) % heartbeatTime == 0)
@@ -124,32 +127,32 @@ public:
 		std::vector<std::tuple<ChunkHandle, ChunkVersion>> chunks;
 		for(it = chunkMap.begin(); it != chunkMap.end(); it++)
 		{
-			ChunkHandle hd = (*it)->handle;
-			ChunkVersion vs = (*it)->version;
-			std::tuple<ChunkHandle, ChunkVersion> tpl = make_tuple(hd, vs);
+			ChunkHandle hd = it->first;
+			ChunkVersion vs = it->second->version;
+			std::tuple<ChunkHandle, ChunkVersion> tpl = std::make_tuple(hd, vs);
 			chunks.push_back(tpl);
 		}
-		mid = srv.RPCCall(srv.ListService("master")[0], "RPCHeartbeat", leaseExtensions, chunks, failedChunks);
-		if(mid.get<0>.errCode != GFSErrorCode::OK)
-			break;
-		std::vector<std::string> garbageChunks = mid.get<1>;
+		mid = srv.RPCCall(srv.ListService("master")[0], "RPCHeartbeat", leaseExtensions, chunks, failedChunks).get().as<std::tuple<GFSError, std::vector<ChunkHandle>>>();
+		if(std::get<0>(mid).errCode != GFSErrorCode::OK)
+			return;
+		std::vector<ChunkHandle> garbageChunks = std::get<1>(mid);
 		for(int i = 0; i < garbageChunks.size(); i++)
 		{
 			Chunk* curC = chunkMap[garbageChunks[i]];
 			delete curC;
-			std::remove(char* (serverID + "_" + chtos(garbageChunks) + ".chunks").c_str());
+			std::remove((prtos(serverPort) + "_" + chtos(garbageChunks[i]) + ".chunks").c_str());
 		}
 		leaseExtensions.clear();
-		failChunks.clear();
+		failedChunks.clear();
 	}
 
 	// FINISHED -- added by myself
 	// delete chunks for another chunk (which is dead)
 	GFSError
-		RPCDeleteChunk(std::string serverID, ChunkHandle handle)
+		RPCDeleteChunk(std::uint16_t serverPort, ChunkHandle handle)
 		{
-			std::remove(char* (serverID + "_" + chtos(handle) + ".chunk").c_str());	
-			if(srv.getLocalRPCPort() == serverID)
+			std::remove((prtos(serverPort) + "_" + chtos(handle) + ".chunk").c_str());	
+			if(srv.getLocalRPCPort() == serverPort)
 			{
 				delete chunkMap[handle];
 				chunkMap.erase(handle); 
@@ -162,9 +165,10 @@ public:
 	GFSError
 		RPCCreateChunk(ChunkHandle handle)
 		{
-			Chunk* now = new Chunk(handle);
+			Chunk* now = new Chunk;
+			now->handle = handle;
 			chunkMap[handle] = now;
-			GFSError Csq(GFSErrorCode::OK)
+			GFSError Csq(GFSErrorCode::OK);
 			return Csq;
 		}
 
@@ -176,17 +180,18 @@ public:
 			if(!chunkMap.count(handle))
 			{
 				GFSError Csq(GFSErrorCode::invalidHandle);
-				std::tuple<GFSError, std::string> Rtn = make_tuple(Csq, "");
+				std::tuple<GFSError, std::string> Rtn = std::make_tuple(Csq, "");
 				return Rtn;	
 			}
-			ifstream infile;
-			infile.open(serverID + "_" + chtos(handle) + ".chunk");
+			std::ifstream infile;
+			infile.open(prtos(serverPort) + "_" + chtos(handle) + ".chunk");
 			infile.seekg(offset);
-			std::string ans;
-			infile.read(ans, length);
+			char input[Chunk::chunkLength + 5];
+			infile.read(input, length);
+			std::string ans = input;
 			infile.close();
 			GFSError Csq(GFSErrorCode::OK);
-			std::tuple<GFSError, std::string> Rtn = make_tuple(Csq, ans);
+			std::tuple<GFSError, std::string> Rtn = std::make_tuple(Csq, ans);
 			return Rtn;
 		}
 
@@ -202,16 +207,17 @@ public:
 				return Csq;
 			}
 			leaseExtensions.push_back(handle);
-			ofstream outfile;
-			outfile.open(serverID + "_" + handle + ".chunk");
+			std::ofstream outfile;
+			outfile.open(prtos(serverPort) + "_" + chtos(handle) + ".chunk");
 			outfile.seekp(offset);
-			outfile << dataMap[dataID];
+			std::string output = dataMap[dataID];
+			outfile.write(output.c_str(), output.length());
 			outfile.close();
 			Chunk* curC = chunkMap[handle];
 			curC->serialNo++;
 			for(int i = 0; i < secondaries.size(); i++)
 			{
-				GFSError mid = srv.RPCCall(secondaries[i], "RPCApplyMutation", handle, curC->serialNo, MutationWrite, dataID, offset, dataMap[dataID].length());	
+				GFSError mid = srv.RPCCall(LightDS::User::RPCAddress::from_string(secondaries[i]), "RPCApplyMutation", handle, curC->serialNo, MutationWrite, dataID, offset, (uint64_t)dataMap[dataID].length()).get().as<GFSError>();	
 				if(mid.errCode != GFSErrorCode::OK)
 				{
 					return mid;	
@@ -230,44 +236,44 @@ public:
 		RPCAppendChunk(ChunkHandle handle, std::uint64_t dataID, std::vector<std::string> secondaries)
 		{
 			std::string data = dataMap[dataID];
-			uint64_t fileSize = getFileSize((serverID + "_" + chtos(handle) + ".chunk").c_str());
+			uint64_t fileSize = getFileSize((prtos(serverPort) + "_" + chtos(handle) + ".chunk"));
 			if(fileSize + (uint64_t)data.length() > Chunk::chunkLength)
 			{	
-				ofstream outfile;
-				outfile.open(serverID + "_" + chtos(handle) + ".chunk");
+				std::ofstream outfile;
+				outfile.open(prtos(serverPort) + "_" + chtos(handle) + ".chunk");
 				outfile.seekp(fileSize);
 				for(int i = 0; i < Chunk::chunkLength - fileSize; i++)
-					outfile.write('*');
+					outfile.write("*", 1);
 				chunkMap[handle]->serialNo++;
 				for(int i = 0; i < secondaries.size(); i++)
 				{
-					GFSError mid = srv.RPCCall(secondaries[i], "RPCApplyMutation", handle, chunkMap[handle]->serialNo, MutationPad, dataID, fileSize, data.length());
+					GFSError mid = srv.RPCCall(LightDS::User::RPCAddress::from_string(secondaries[i]), "RPCApplyMutation", handle, chunkMap[handle]->serialNo, MutationPad, dataID, fileSize, (uint64_t)data.length()).get().as<GFSError>();
 					if(mid.errCode != GFSErrorCode::OK)
-						return make_tuple(mid, 0);
+						return std::make_tuple(mid, 0);
 				}
 				GFSError Csq(GFSErrorCode::retryAppend);
-				return make_tuple(Csq, 0);
+				return std::make_tuple(Csq, 0);
 			}
-			ofstream outfile;
-			outfile.open(serverID + "_" + chtos(handle) + ".chunk");
+			std::ofstream outfile;
+			outfile.open(prtos(serverPort) + "_" + chtos(handle) + ".chunk");
 			outfile.seekp(fileSize);
-			outfile.write(data);
+			outfile.write(data.c_str(), data.length());
 			chunkMap[handle]->serialNo++;
 			for(int i = 0; i < secondaries.size(); i++)
 			{
-				GFSError mid = srv.RPCCall(secondaries[i], "RPCApplyMutation", handle, chunkMap[handle]->serialNo, MutationAppend, dataID, fileSize, data.length());
+				GFSError mid = srv.RPCCall(LightDS::User::RPCAddress::from_string(secondaries[i]), "RPCApplyMutation", handle, chunkMap[handle]->serialNo, MutationAppend, dataID, fileSize, (uint64_t)data.length()).get().as<GFSError>();
 				if(mid.errCode != GFSErrorCode::OK)
-					return make_tuple(mid, 0);
+					return std::make_tuple(mid, 0);
 			}
 			GFSError Csq(GFSErrorCode::OK);
 			leaseExtensions.push_back(handle);
-			return make_tuple(Csq, fileSize);
+			return std::make_tuple(Csq, fileSize);
 		}
 
 	// FINISHED
 	// RPCApplyMutation is called by primary to apply mutations
 	GFSError
-		RPCApplyMutation(ChunkHandle handle, std::uint64_t serialNo, MutationType type, std::uint64_t dataID, std::uint64_t offset, std::uint64_t length);
+		RPCApplyMutation(ChunkHandle handle, std::uint64_t serialNo, MutationType type, std::uint64_t dataID, std::uint64_t offset, std::uint64_t length)
 		{
 			if(!chunkMap.count(handle))
 			{
@@ -282,16 +288,17 @@ public:
 					GFSError Csq(GFSErrorCode::wrongSerialNo);
 					return Csq;
 				}
-				ofstream outfile;
-				outfile.open(serverID + "_" + handle + ".chunk");
+				std::ofstream outfile;
+				outfile.open(prtos(serverPort) + "_" + chtos(handle) + ".chunk");
 				outfile.seekp(offset);
-				outfile << dataMap[dataID];
+				std::string output = dataMap[dataID];
+				outfile.write(output.c_str(), output.length());
 				outfile.close();
 				curC->serialNo++;
 				GFSError Csq(GFSErrorCode::OK);
 				return Csq;
 			}
-			else if(type == MutaionAppend)
+			else if(type == MutationAppend)
 			{
 				Chunk* curC = chunkMap[handle];
 				if(curC->serialNo != serialNo - 1)
@@ -299,10 +306,11 @@ public:
 					GFSError Csq(GFSErrorCode::wrongSerialNo);
 					return Csq;
 				}
-				ofstream outfile;
-				outfile.open(serverID + "_" + chtos(handle) + ".chunk");
-				outfile.seekp(fileSize);
-				outfile.write(data);
+				std::ofstream outfile;
+				outfile.open(prtos(serverPort) + "_" + chtos(handle) + ".chunk");
+				outfile.seekp(offset);
+				std::string input = dataMap[dataID];
+				outfile.write(input.c_str(), input.length());
 				curC->serialNo++;
 				GFSError Csq(GFSErrorCode::OK);
 				return Csq;
@@ -315,11 +323,11 @@ public:
 					GFSError Csq(GFSErrorCode::wrongSerialNo);
 					return Csq;
 				}
-				ofstream outfile;
-				outfile.open(serverID + "_" + chtos(handle) + ".chunk");
-				outfile.seekp(fileSize);
-				for(int i = 0; i < Chunk::chunkLength - fileSize; i++)
-					outfile.write('*');
+				std::ofstream outfile;
+				outfile.open(prtos(serverPort) + "_" + chtos(handle) + ".chunk");
+				outfile.seekp(offset);
+				for(int i = 0; i < Chunk::chunkLength - offset; i++)
+					outfile.write("*", 1);
 				curC->serialNo++;
 				GFSError Csq(GFSErrorCode::OK);
 				return Csq;
@@ -337,12 +345,13 @@ public:
 				return Csq;	
 			}
 			Chunk* curC = chunkMap[handle];
-			ifstream infile;
-			infile.open(serverID + "_" + chtos(handle) + ".chunk");
-			std::string data;
-			infile.read(data, Chunk::chunkLength);
+			std::ifstream infile;
+			infile.open(prtos(serverPort) + "_" + chtos(handle) + ".chunk");
+			char input[Chunk::chunkLength + 5];
+			infile.read(input, Chunk::chunkLength);
+			std::string data = input;
 			infile.close();
-			GFSError mid = srv.RPCCall(addr, "RPCApplyCopy", handle, curC->version, data, curC->serialNo);
+			GFSError mid = srv.RPCCall(LightDS::User::RPCAddress::from_string(addr), "RPCApplyCopy", handle, curC->version, data, curC->serialNo).get().as<GFSError>();
 			return mid;
 		}
 
@@ -356,19 +365,20 @@ public:
 			{
 				Chunk* curC = new Chunk;
 				chunkMap[handle] = curC;
-				ofstream outfile;
-				outfile.open(serverID + "_" + chtos(handle) + ".chunk", ofstream::trunc);
-				outfile << data;
+				std::ofstream outfile;
+				outfile.open(prtos(serverPort) + "_" + chtos(handle) + ".chunk", std::ofstream::trunc);
+				outfile.write(data.c_str(), data.length());
 				outfile.close();
+				curC->handle = handle;
 				curC->version = version;
 				curC->serialNo = serialNo;
 			}
 			else
 			{
 				Chunk* curC = chunkMap[handle];
-				ofstream outfile;
-				outfile.open(serverID + "_" + chtos(handle) + ".chunk", ofstream::trunc);
-				outfile << data;
+				std::ofstream outfile;
+				outfile.open(prtos(serverPort) + "_" + chtos(handle) + ".chunk", std::ofstream::trunc);
+				outfile.write(data.c_str(), data.length());
 				outfile.close();
 				curC->version = version;
 				curC->serialNo = serialNo;
@@ -384,9 +394,9 @@ public:
 			bool flag = 1;
 			for(int i = 0; i < vct.size(); i++)
 			{
-				ChunkHandle hd = vct[i].get<0>;
-				ChunkVersion vs = vct[i].get<1>;
-				uint64_t expireTS = vct[i].get<2>;
+				ChunkHandle hd = std::get<0>(vct[i]);
+				ChunkVersion vs = std::get<1>(vct[i]);
+				uint64_t expireTS = std::get<2>(vct[i]);
 				if(!chunkMap.count(hd))
 				{
 					flag = 0;
